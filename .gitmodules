@@ -1,0 +1,6 @@
+[submodule "ext/libtuntap"]
+	path = ext/libtuntap
+	url = https://github.com/LaKabane/libtuntap
+[submodule "ext/libsocket"]
+	path = ext/libsocket
+	url = ../../../aduulm/external/libsocket.git
