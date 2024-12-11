@@ -22,4 +22,4 @@ add_executable(multi_tun multi_tun.cpp)
 target_compile_options(multi_tun PUBLIC -Wall -Wextra -pedantic -Werror)
 target_include_directories(
   multi_tun SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ext/libsocket/headers)
-target_link_libraries(multi_tun PRIVATE tuntap++ socket++)
+target_link_libraries(multi_tun PRIVATE tuntap++ socket++ -static)

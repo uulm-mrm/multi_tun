@@ -3,109 +3,134 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <unordered_map>
 
 #include <cstdint>
 #include <poll.h>
 #include <unistd.h>
 
+#include <inetclientdgram.hpp>
 #include <inetserverdgram.hpp>
 #include <tuntap++.hh>
-#include <unordered_set>
 
 constexpr bool debug = false;
 
 class MultiTun {
-    using string_pair = std::pair<std::string, std::string>;
-    struct Endpoint : public string_pair {
-        struct Hasher {
-            inline std::size_t operator()(const Endpoint& endpoint) const {
-                return std::hash<std::string>{}(endpoint.first + endpoint.second);
-            }
-        };
+public:
+    using UdpSocket = libsocket::inet_dgram_server;
 
-        std::string& addr() { return first; }
-        std::string& port() { return second; }
-        const std::string& addr() const { return first; }
-        const std::string& port() const { return second; }
+    struct Endpoint {
+        std::string addr;
+        std::string port;
+        std::shared_ptr<UdpSocket> udp_sock;
 
-        Endpoint() : string_pair{{}, {}} {}
-
-        Endpoint(const std::string& addr, const std::string& port) : string_pair{addr, port} {}
+        std::string get_key() const { return addr + ':' + port; }
     };
 
+protected:
     static constexpr int mtu = 1500;
+    static constexpr int max_socks = 100;
 
     // socket data
     std::unique_ptr<tuntap::tun> tun_sock;
-    std::unique_ptr<libsocket::inet_dgram_server> udp_sock;
-    std::array<struct pollfd, 2> fds{};
-    struct pollfd& tun_fd = fds[0];
-    struct pollfd& udp_fd = fds[1];
+    std::shared_ptr<UdpSocket> server_udp_sock;
+    std::array<struct pollfd, max_socks> fds;
+    int n_udp_fds = 0;
 
     // control data
-    std::unordered_set<Endpoint, Endpoint::Hasher> endpoints;
+    std::unordered_map<std::string, Endpoint> endpoints;
+    std::unordered_map<int, std::shared_ptr<UdpSocket>> fd_to_sock;
+
+    void init() {
+        if (tun_sock) { throw std::runtime_error("double init"); }
+        tun_sock = std::make_unique<tuntap::tun>();
+        tun_sock->ip(tun_listen_addr, 24);
+        tun_sock->mtu(mtu);
+        tun_sock->up();
+        std::memset(fds.data(), 0, sizeof(*fds.data()));
+        n_udp_fds = 0;
+    }
 
 public:
     // config data
     std::string tun_listen_addr;
-    std::string udp_listen_addr;
     std::string udp_listen_port;
 
     MultiTun() {}
 
     ~MultiTun() {}
 
-    void init() {
-        tun_sock = std::make_unique<tuntap::tun>();
-        tun_sock->ip(tun_listen_addr, 24);
-        tun_sock->mtu(mtu);
-        tun_sock->up();
-        udp_sock = std::make_unique<libsocket::inet_dgram_server>(udp_listen_addr, udp_listen_port,
-                                                                  LIBSOCKET_IPv4);
-        std::memset(fds.data(), 0, sizeof(*fds.data()));
-        tun_fd.events = POLLIN;
+    void init_server(const std::string& udp_listen_addr) {
+        init();
+
+        // server socket/endpoint
+        server_udp_sock =
+                std::make_shared<UdpSocket>(udp_listen_addr, udp_listen_port, LIBSOCKET_IPv4);
+
+        struct pollfd& udp_fd = fds[++n_udp_fds];
+        udp_fd.fd = server_udp_sock->getfd();
         udp_fd.events = POLLIN;
-        tun_fd.fd = tun_sock->native_handle();
-        udp_fd.fd = udp_sock->getfd();
+        fd_to_sock.insert({udp_fd.fd, server_udp_sock});
     }
 
-    void add_endpoint(const std::string& addr, const std::string& port) {
-        endpoints.insert(Endpoint{addr, port});
-        for (const auto& endpoint: endpoints) {
-            std::cout << "manually adding endpoint " << endpoint.addr() << ":" << endpoint.port()
-                      << std::endl;
-        }
+    void init_client() { init(); }
+
+    void add_endpoint(const std::string& udp_listen_addr, const std::string& server_addr) {
+        const auto udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4);
+        // udp_sock->connect(server_addr, udp_listen_port);
+        MultiTun::Endpoint new_ep{server_addr, udp_listen_port, udp_sock};
+        std::cout << "manually adding endpoint " << new_ep.get_key() << std::endl;
+        endpoints[new_ep.get_key()] = std::move(new_ep);
+
+        struct pollfd& udp_fd = fds[++n_udp_fds];
+        udp_fd.fd = udp_sock->getfd();
+        udp_fd.events = POLLIN;
+        fd_to_sock.insert({udp_fd.fd, udp_sock});
     }
 
     void run_loop() {
-        Endpoint endpoint;
+        struct pollfd& tun_fd = fds[0];
+        tun_fd.fd = tun_sock->native_handle();
+        tun_fd.events = POLLIN;
+
         std::array<uint8_t, mtu> buffer;
         int size;
         while (true) {
-            if (debug) std::cout << "polling ..." << std::endl;
-            int poll_res = poll(fds.data(), 2, -1);
+            if (debug) std::cout << "polling on " << 1 + n_udp_fds << " fds ..." << std::endl;
+            int poll_res = poll(fds.data(), 1 + n_udp_fds, -1);
             if (poll_res < 0) { break; }
             if (debug) std::cout << "poll() returned " << poll_res << std::endl;
             if (tun_fd.revents & POLLIN) {
                 size = tun_sock->read(buffer.data(), mtu);
                 if (debug) std::cout << "got tun packet of size " << size << std::endl;
-                for (const auto& endpoint: endpoints) {
+                for (const auto& [_, ep]: endpoints) {
                     if (debug)
-                        std::cout << "sending to endpoint " << endpoint.addr() << ":"
-                                  << endpoint.port() << std::endl;
-                    udp_sock->sndto(buffer.data(), size, endpoint.addr(), endpoint.port());
+                        std::cout << "sending to endpoint " << ep.get_key()
+                                  << std::endl;
+                    ep.udp_sock->sndto(buffer.data(), size, ep.addr, ep.port);
                 }
             }
-            if (udp_fd.revents & POLLIN) {
-                size = udp_sock->rcvfrom(buffer.data(), mtu, endpoint.addr(), endpoint.port(), 0,
-                                         true);
+            for (int i = 0; i < n_udp_fds; ++i) {
+                auto& fd = fds[i + 1];
+                if ((fd.revents & POLLIN) == 0) { continue; }
+                std::shared_ptr<UdpSocket> udp_sock = fd_to_sock.at(fd.fd);
+                Endpoint tmp_ep;
+                size = udp_sock->rcvfrom(buffer.data(), mtu, tmp_ep.addr, tmp_ep.port, 0, true);
                 if (debug) std::cout << "got udp packet of size " << size << std::endl;
-                bool inserted = endpoints.insert(endpoint).second;
-                if (inserted) {
-                    std::cout << "automatically added endpoint " << endpoint.addr() << ":"
-                              << endpoint.port() << std::endl;
-                }
+
+                // send to tun
                 tun_sock->write(buffer.data(), size);
+
+                if (udp_sock == server_udp_sock && 1 + n_udp_fds < max_socks) {
+                    // add new client
+                    auto [it, inserted] = endpoints.insert({tmp_ep.get_key(), tmp_ep});
+                    if (inserted) {
+                        Endpoint& new_ep = it->second;
+                        std::cout << "automatically added endpoint " << new_ep.get_key() << std::endl;
+                        new_ep.udp_sock = server_udp_sock;
+                    }
+                }
             }
             if (debug) std::cout << std::endl;
         }
@@ -115,26 +140,31 @@ public:
 int main(int argc, char* argv[]) {
     try {
         MultiTun multi_tun;
-        multi_tun.udp_listen_port = "4242";
+        multi_tun.udp_listen_port = "5678";
         if (argc == 3 && std::strcmp(argv[1], "server") == 0) {
-            multi_tun.udp_listen_addr = argv[2];
-            std::cout << "acting as server, bound to " << multi_tun.udp_listen_addr << std::endl;
+            const std::string udp_listen_addr = argv[2];
+            std::cout << "acting as server, bound to " << udp_listen_addr << std::endl;
             // .1 is server
             multi_tun.tun_listen_addr = "10.42.42.1";
-        } else if (argc == 4 && std::strcmp(argv[1], "client") == 0) {
-            multi_tun.udp_listen_addr = argv[2];
-            const std::string server_addr = argv[3];
-            std::cout << "acting as client, bound to " << multi_tun.udp_listen_addr
-                      << ", connecting to server " << server_addr << std::endl;
+            multi_tun.init_server(udp_listen_addr);
+        } else if (argc >= 4 && std::strcmp(argv[1], "client") == 0) {
+            std::cout << "acting as client" << std::endl;
             // .2 is client
             multi_tun.tun_listen_addr = "10.42.42.2";
-            if (argc > 1) { multi_tun.add_endpoint(server_addr, "4242"); }
+            multi_tun.init_client();
+            for (int i = 2; i + 1 < argc; i += 2) {
+                const std::string udp_listen_addr = argv[i];
+                const std::string server_addr = argv[i + 1];
+                std::cout << "bound to " << udp_listen_addr << ", connecting to " << server_addr
+                          << std::endl;
+                multi_tun.add_endpoint(udp_listen_addr, server_addr);
+            }
         } else {
-            std::cout << "usage: " << argv[0] << " <client|server> <bind addr> [server addr]"
-                      << std::endl;
+            std::cout << "usage:" << std::endl;
+            std::cout << argv[0] << " server <bind addr>" << std::endl;
+            std::cout << argv[0] << " client [<bind addr> <server addr>] ..." << std::endl;
             return -1;
         }
-        multi_tun.init();
         multi_tun.run_loop();
     } catch (libsocket::socket_exception& e) { std::cerr << "error: " << e.mesg << std::endl; }
 }
