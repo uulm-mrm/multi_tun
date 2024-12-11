@@ -31,6 +31,7 @@ public:
 protected:
     static constexpr int mtu = 1500;
     static constexpr int max_socks = 100;
+    static constexpr int max_stored_packets = 1024;
 
     // socket data
     std::unique_ptr<tuntap::tun> tun_sock;
@@ -42,6 +43,10 @@ protected:
     std::unordered_map<std::string, Endpoint> endpoints;
     std::unordered_map<int, std::shared_ptr<UdpSocket>> fd_to_sock;
 
+    // deduplication data
+    std::array<std::array<uint8_t, mtu>, max_stored_packets> packet_list;
+    int packet_cnt = 0;
+
     void init() {
         if (tun_sock) { throw std::runtime_error("double init"); }
         tun_sock = std::make_unique<tuntap::tun>();
@@ -50,6 +55,7 @@ protected:
         tun_sock->up();
         std::memset(fds.data(), 0, sizeof(*fds.data()));
         n_udp_fds = 0;
+        packet_cnt = 0;
     }
 
 public:
@@ -105,9 +111,7 @@ public:
                 size = tun_sock->read(buffer.data(), mtu);
                 if (debug) std::cout << "got tun packet of size " << size << std::endl;
                 for (const auto& [_, ep]: endpoints) {
-                    if (debug)
-                        std::cout << "sending to endpoint " << ep.get_key()
-                                  << std::endl;
+                    if (debug) std::cout << "sending to endpoint " << ep.get_key() << std::endl;
                     ep.udp_sock->sndto(buffer.data(), size, ep.addr, ep.port);
                 }
             }
@@ -118,16 +122,30 @@ public:
                 Endpoint tmp_ep;
                 size = udp_sock->rcvfrom(buffer.data(), mtu, tmp_ep.addr, tmp_ep.port, 0, true);
                 if (debug) std::cout << "got udp packet of size " << size << std::endl;
+                if (size <= 0) { throw std::runtime_error("invalid udp packet size"); }
 
-                // send to tun
-                tun_sock->write(buffer.data(), size);
+                // deduplicate
+                if (size < mtu) { std::memset(&buffer.at(size), 0, mtu - size); }
+                bool is_duplicate = false;
+                for (int i = packet_cnt; i >= 0 && i >= packet_cnt - max_stored_packets; --i) {
+                    if (buffer == packet_list[i % max_stored_packets]) {
+                        is_duplicate = true;
+                        break;
+                    }
+                }
+                if (!is_duplicate) {
+                    // send to tun
+                    tun_sock->write(buffer.data(), size);
+                    packet_list[++packet_cnt % max_stored_packets] = buffer;
+                }
 
                 if (udp_sock == server_udp_sock && 1 + n_udp_fds < max_socks) {
-                    // add new client
+                    // try to add new client
                     auto [it, inserted] = endpoints.insert({tmp_ep.get_key(), tmp_ep});
                     if (inserted) {
                         Endpoint& new_ep = it->second;
-                        std::cout << "automatically added endpoint " << new_ep.get_key() << std::endl;
+                        std::cout << "automatically added endpoint " << new_ep.get_key()
+                                  << std::endl;
                         new_ep.udp_sock = server_udp_sock;
                     }
                 }
