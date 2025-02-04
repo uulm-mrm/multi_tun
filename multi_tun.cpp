@@ -85,7 +85,8 @@ public:
     void set_server_listen_addr(const std::string& udp_listen_addr) {
         if (server_udp_sock) { throw std::runtime_error("double server init"); }
         // server socket/endpoint
-        server_udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, server_port, LIBSOCKET_IPv4);
+        server_udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, server_port, LIBSOCKET_IPv4,
+                                                      SOCK_NONBLOCK);
 
         struct pollfd& udp_fd = fds[++n_udp_fds];
         udp_fd.fd = server_udp_sock->getfd();
@@ -94,7 +95,8 @@ public:
     }
 
     void add_endpoint(const std::string& udp_listen_addr, const std::string& server_addr) {
-        const auto udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4);
+        const auto udp_sock =
+                std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4, SOCK_NONBLOCK);
         Endpoint new_ep{server_addr, server_port, udp_sock};
         std::cout << "manually adding endpoint " << new_ep.get_key() << std::endl;
         endpoints[new_ep.get_key()] = std::move(new_ep);
