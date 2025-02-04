@@ -4,3 +4,6 @@
 [submodule "ext/libsocket"]
 	path = ext/libsocket
 	url = https://github.com/mertemba/libsocket
+[submodule "ext/argparse"]
+	path = ext/argparse
+	url = https://github.com/morrisfranken/argparse

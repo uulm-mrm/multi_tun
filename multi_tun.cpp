@@ -10,11 +10,23 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include <argparse/argparse.hpp>
 #include <inetclientdgram.hpp>
 #include <inetserverdgram.hpp>
 #include <tuntap++.hh>
 
 constexpr bool debug = false;
+
+struct MultiTunArgs : public argparse::Args {
+    std::optional<std::string>& server_listen_addr =
+            kwarg("s,server_listen_addr", "enable server mode at the given listen address");
+    int& server_port = kwarg("p,server_port", "UDP listen port of the server");
+    std::string& tun_listen_addr =
+            kwarg("l,tun_listen_addr", "address of the created TUN device; server and client need "
+                                       "to have different addresses in the same /24 subnet");
+    std::optional<std::vector<std::string>>& client_endpoints = kwarg(
+            "c,client_endpoints", "comma-separated list of <client bind addr>:<server addr> pairs");
+};
 
 class MultiTun {
 public:
@@ -47,6 +59,15 @@ protected:
     std::array<std::array<uint8_t, mtu>, max_stored_packets> packet_list;
     int packet_cnt = 0;
 
+public:
+    // config data
+    std::string tun_listen_addr;
+    std::string server_port;
+
+    MultiTun() {}
+
+    ~MultiTun() {}
+
     void init() {
         if (tun_sock) { throw std::runtime_error("double init"); }
         tun_sock = std::make_unique<tuntap::tun>();
@@ -58,21 +79,10 @@ protected:
         packet_cnt = 0;
     }
 
-public:
-    // config data
-    std::string tun_listen_addr;
-    std::string udp_listen_port;
-
-    MultiTun() {}
-
-    ~MultiTun() {}
-
-    void init_server(const std::string& udp_listen_addr) {
-        init();
-
+    void set_server_listen_addr(const std::string& udp_listen_addr) {
+        if (server_udp_sock) { throw std::runtime_error("double server init"); }
         // server socket/endpoint
-        server_udp_sock =
-                std::make_shared<UdpSocket>(udp_listen_addr, udp_listen_port, LIBSOCKET_IPv4);
+        server_udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, server_port, LIBSOCKET_IPv4);
 
         struct pollfd& udp_fd = fds[++n_udp_fds];
         udp_fd.fd = server_udp_sock->getfd();
@@ -80,12 +90,9 @@ public:
         fd_to_sock.insert({udp_fd.fd, server_udp_sock});
     }
 
-    void init_client() { init(); }
-
     void add_endpoint(const std::string& udp_listen_addr, const std::string& server_addr) {
         const auto udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4);
-        // udp_sock->connect(server_addr, udp_listen_port);
-        MultiTun::Endpoint new_ep{server_addr, udp_listen_port, udp_sock};
+        MultiTun::Endpoint new_ep{server_addr, server_port, udp_sock};
         std::cout << "manually adding endpoint " << new_ep.get_key() << std::endl;
         endpoints[new_ep.get_key()] = std::move(new_ep);
 
@@ -156,32 +163,39 @@ public:
 };
 
 int main(int argc, char* argv[]) {
+    auto args = argparse::parse<MultiTunArgs>(argc, argv);
+    std::cout << "multi_tun arguments:" << std::endl;
+    args.print();
+    if (args.server_listen_addr.has_value() == args.client_endpoints.has_value()) {
+        std::cout << "argument error: either a server address or client endpoints must be given"
+                  << std::endl;
+        return -1;
+    }
+
     try {
         MultiTun multi_tun;
-        multi_tun.udp_listen_port = "5678";
-        if (argc == 3 && std::strcmp(argv[1], "server") == 0) {
-            const std::string udp_listen_addr = argv[2];
+        multi_tun.server_port = std::to_string(args.server_port);
+        multi_tun.tun_listen_addr = args.tun_listen_addr;
+        multi_tun.init();
+        if (args.server_listen_addr) {
+            // enable server mode
+            const std::string udp_listen_addr = args.server_listen_addr.value();
             std::cout << "acting as server, bound to " << udp_listen_addr << std::endl;
-            // .1 is server
-            multi_tun.tun_listen_addr = "10.42.42.1";
-            multi_tun.init_server(udp_listen_addr);
-        } else if (argc >= 4 && std::strcmp(argv[1], "client") == 0) {
-            std::cout << "acting as client" << std::endl;
-            // .2 is client
-            multi_tun.tun_listen_addr = "10.42.42.2";
-            multi_tun.init_client();
-            for (int i = 2; i + 1 < argc; i += 2) {
-                const std::string udp_listen_addr = argv[i];
-                const std::string server_addr = argv[i + 1];
+            multi_tun.set_server_listen_addr(udp_listen_addr);
+        } else {
+            for (const std::string& client_endpoint: *args.client_endpoints) {
+                std::size_t sep_pos = client_endpoint.find(':');
+                if (sep_pos == std::string::npos) {
+                    std::cout << "argument error: client endpoints must be "
+                              << "<client bind addr>:<server addr> pairs" << std::endl;
+                    return -1;
+                }
+                const std::string udp_listen_addr = client_endpoint.substr(0, sep_pos);
+                const std::string server_addr = client_endpoint.substr(sep_pos + 1);
                 std::cout << "bound to " << udp_listen_addr << ", connecting to " << server_addr
                           << std::endl;
                 multi_tun.add_endpoint(udp_listen_addr, server_addr);
             }
-        } else {
-            std::cout << "usage:" << std::endl;
-            std::cout << argv[0] << " server <bind addr>" << std::endl;
-            std::cout << argv[0] << " client [<bind addr> <server addr>] ..." << std::endl;
-            return -1;
         }
         multi_tun.run_loop();
     } catch (libsocket::socket_exception& e) { std::cerr << "error: " << e.mesg << std::endl; }
