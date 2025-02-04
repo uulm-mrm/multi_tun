@@ -3,4 +3,4 @@
 	url = https://github.com/LaKabane/libtuntap
 [submodule "ext/libsocket"]
 	path = ext/libsocket
-	url = ../../../aduulm/external/libsocket.git
+	url = https://github.com/mertemba/libsocket
