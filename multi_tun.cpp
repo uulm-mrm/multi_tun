@@ -1,7 +1,9 @@
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
@@ -36,6 +38,7 @@ public:
         std::string addr;
         std::string port;
         std::shared_ptr<UdpSocket> udp_sock;
+        int64_t t_last_active = std::numeric_limits<int64_t>::max();
 
         std::string get_key() const { return addr + ':' + port; }
     };
@@ -92,7 +95,7 @@ public:
 
     void add_endpoint(const std::string& udp_listen_addr, const std::string& server_addr) {
         const auto udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4);
-        MultiTun::Endpoint new_ep{server_addr, server_port, udp_sock};
+        Endpoint new_ep{server_addr, server_port, udp_sock};
         std::cout << "manually adding endpoint " << new_ep.get_key() << std::endl;
         endpoints[new_ep.get_key()] = std::move(new_ep);
 
@@ -111,8 +114,24 @@ public:
         int size;
         while (true) {
             if (debug) std::cout << "polling on " << 1 + n_udp_fds << " fds ..." << std::endl;
-            int poll_res = poll(fds.data(), 1 + n_udp_fds, -1);
+            int poll_res = poll(fds.data(), 1 + n_udp_fds, 1000);
             if (poll_res < 0) { break; }
+            const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count();
+            if (poll_res == 0) {
+                // remove endpoints with timeout, one at a time
+                std::string key_to_remove;
+                for (const auto& [key, ep]: endpoints) {
+                    if (now - ep.t_last_active >= 5) {
+                        std::cout << "removing stale endpoint " << key << std::endl;
+                        key_to_remove = key;
+                        break;
+                    }
+                }
+                if (key_to_remove.size()) { endpoints.erase(key_to_remove); }
+                continue;
+            }
             if (debug) std::cout << "poll() returned " << poll_res << std::endl;
             if (tun_fd.revents & POLLIN) {
                 size = tun_sock->read(buffer.data(), mtu);
@@ -146,14 +165,14 @@ public:
                     packet_list[++packet_cnt % max_stored_packets] = buffer;
                 }
 
-                if (udp_sock == server_udp_sock && 1 + n_udp_fds < max_socks) {
+                if (udp_sock == server_udp_sock) {
                     // try to add new client
                     auto [it, inserted] = endpoints.insert({tmp_ep.get_key(), tmp_ep});
+                    Endpoint& ep_in_map = it->second;
+                    ep_in_map.t_last_active = now;
                     if (inserted) {
-                        Endpoint& new_ep = it->second;
-                        std::cout << "automatically added endpoint " << new_ep.get_key()
-                                  << std::endl;
-                        new_ep.udp_sock = server_udp_sock;
+                        std::cout << "automat. added endpoint " << ep_in_map.get_key() << std::endl;
+                        ep_in_map.udp_sock = server_udp_sock;
                     }
                 }
             }
