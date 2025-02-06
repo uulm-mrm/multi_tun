@@ -28,6 +28,9 @@ struct MultiTunArgs : public argparse::Args {
                                        "to have different addresses in the same /24 subnet");
     std::optional<std::vector<std::string>>& client_endpoints = kwarg(
             "c,client_endpoints", "comma-separated list of <client bind addr>:<server addr> pairs");
+    bool& nonblocking = kwarg("n,nonblocking", "use non-blocking sockets").set_default(false);
+    int& timeout =
+            kwarg("t,timeout", "timeout (in seconds) to remove stale endpoints").set_default(20);
 };
 
 class MultiTun {
@@ -66,6 +69,8 @@ public:
     // config data
     std::string tun_listen_addr;
     std::string server_port;
+    bool nonblocking = false;
+    int timeout = 5;
 
     MultiTun() {}
 
@@ -86,7 +91,7 @@ public:
         if (server_udp_sock) { throw std::runtime_error("double server init"); }
         // server socket/endpoint
         server_udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, server_port, LIBSOCKET_IPv4,
-                                                      SOCK_NONBLOCK);
+                                                      nonblocking ? SOCK_NONBLOCK : 0);
 
         struct pollfd& udp_fd = fds[++n_udp_fds];
         udp_fd.fd = server_udp_sock->getfd();
@@ -95,8 +100,8 @@ public:
     }
 
     void add_endpoint(const std::string& udp_listen_addr, const std::string& server_addr) {
-        const auto udp_sock =
-                std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4, SOCK_NONBLOCK);
+        const auto udp_sock = std::make_shared<UdpSocket>(udp_listen_addr, "", LIBSOCKET_IPv4,
+                                                          nonblocking ? SOCK_NONBLOCK : 0);
         Endpoint new_ep{server_addr, server_port, udp_sock};
         std::cout << "manually adding endpoint " << new_ep.get_key() << std::endl;
         endpoints[new_ep.get_key()] = std::move(new_ep);
@@ -125,7 +130,7 @@ public:
                 // remove endpoints with timeout, one at a time
                 std::string key_to_remove;
                 for (const auto& [key, ep]: endpoints) {
-                    if (now - ep.t_last_active >= 5) {
+                    if (now - ep.t_last_active >= timeout) {
                         std::cout << "removing stale endpoint " << key << std::endl;
                         key_to_remove = key;
                         break;
@@ -197,6 +202,8 @@ int main(int argc, char* argv[]) {
         MultiTun multi_tun;
         multi_tun.server_port = std::to_string(args.server_port);
         multi_tun.tun_listen_addr = args.tun_listen_addr;
+        multi_tun.nonblocking = args.nonblocking;
+        multi_tun.timeout = args.timeout;
         multi_tun.init();
         if (args.server_listen_addr) {
             // enable server mode
