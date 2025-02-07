@@ -15,19 +15,21 @@ Note:
 
 ### Example
 
+![multi_tun example diagram](multi_tun_example.png)
+
 The server/first peer creates a TUN device at 10.42.42.1 and listens on UDP port 5678 for incoming packets:
 
 ```sh
 $ sudo multi_tun -l 10.42.42.1 -s 0.0.0.0 -p 5678
 ```
 
-The client/second peer creates a TUN device at 10.42.42.2 and connects to the server at 192.168.123.2 and 10.0.0.2 while binding to .1 on both interfaces:
+The client/second peer creates a TUN device at 10.42.42.2 and connects to the server at 192.168.123.1 and 10.0.0.1 while binding to .2 on both interfaces:
 
 ```sh
-$ sudo multi_tun -l 10.42.42.2 -c 192.168.123.1:192.168.123.2,10.0.0.1:10.0.0.2 -p 5678
+$ sudo multi_tun -l 10.42.42.2 -c 192.168.123.2:192.168.123.1,10.0.0.2:10.0.0.1 -p 5678
 ```
 
-Now the server and client can reach each other via their respective TUN addresses.
+Now the server and client can reach each other by binding on their own TUN address and connecting to the other TUN address.
 
 ### License
 
